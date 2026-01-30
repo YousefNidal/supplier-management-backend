@@ -1,630 +1,630 @@
 const express = require('express');
 const cors = require('cors');
 const sqlite3 = require('sqlite3').verbose();
+const path = require('path');
 
 const app = express();
-const PORT = 3000;
+const PORT = process.env.PORT || 3000;
 
 // Middleware
 app.use(cors());
 app.use(express.json());
-
-// Конфигурация аутентификации
-const SELLER_CREDENTIALS = {
-  username: 'kizuma',
-  password: 'kizuma'
-};
-
-// Middleware для проверки аутентификации
-const authenticate = (req, res, next) => {
-  const authHeader = req.headers.authorization;
-  
-  if (!authHeader) {
-    return res.status(401).json({ error: 'Требуется аутентификация' });
-  }
-  
-  const token = authHeader.split(' ')[1];
-  if (!token) {
-    return res.status(401).json({ error: 'Неверный формат токена' });
-  }
-  
-  try {
-    const decoded = Buffer.from(token, 'base64').toString('utf-8');
-    const [username, password] = decoded.split(':');
-    
-    if (username === SELLER_CREDENTIALS.username && password === SELLER_CREDENTIALS.password) {
-      req.user = { username, role: 'seller' };
-      next();
-    } else {
-      res.status(401).json({ error: 'Неверные учетные данные' });
-    }
-  } catch (error) {
-    res.status(401).json({ error: 'Ошибка аутентификации' });
-  }
-};
-
-// Middleware для гостевого доступа (только GET запросы)
-const guestAccess = (req, res, next) => {
-  if (req.method === 'GET') {
-    req.user = { username: 'guest', role: 'guest' };
-    next();
-  } else {
-    res.status(401).json({ error: 'Требуется аутентификация для этого действия' });
-  }
-};
+app.use(express.static('public'));
 
 // Подключение к базе данных
 const db = new sqlite3.Database('./database.db', (err) => {
   if (err) {
-    console.error('Ошибка подключения к базе данных:', err.message);
+    console.error('Ошибка подключения к базе данных:', err);
   } else {
-    console.log('Подключено к базе данных SQLite');
+    console.log('Подключение к SQLite базе данных установлено');
   }
 });
 
-// Middleware для логгирования запросов
+// Middleware для логирования
 app.use((req, res, next) => {
-  console.log(`${new Date().toISOString()} - ${req.method} ${req.url} - User: ${req.user?.username || 'unauthorized'}`);
+  console.log(`${new Date().toISOString()} ${req.method} ${req.url}`);
   next();
 });
 
-// ==================== ЭНДПОИНТЫ АУТЕНТИФИКАЦИИ ====================
+// API Routes
 
-// Логин
-app.post('/api/login', (req, res) => {
-  const { username, password } = req.body;
-  
-  console.log('Login attempt:', { username, password });
-  
-  if (username === SELLER_CREDENTIALS.username && password === SELLER_CREDENTIALS.password) {
-    // Создаем базовый токен
-    const token = Buffer.from(`${username}:${password}`).toString('base64');
-    
-    res.json({
-      success: true,
-      token,
-      user: {
-        username,
-        role: 'seller'
-      },
-      message: 'Успешный вход'
-    });
-  } else {
-    res.status(401).json({
-      success: false,
-      error: 'Неверные учетные данные'
-    });
-  }
-});
-
-// Проверка токена
-app.get('/api/verify-auth', authenticate, (req, res) => {
-  res.json({
-    authenticated: true,
-    user: req.user
-  });
-});
-
-// ==================== ПУБЛИЧНЫЕ ЭНДПОИНТЫ (гостевой доступ) ====================
-
-// Получить информацию о продавце (публичный)
-app.get('/api/seller', guestAccess, (req, res) => {
+// Получение продавца
+app.get('/api/seller', (req, res) => {
   db.get('SELECT * FROM seller WHERE id = 1', (err, row) => {
     if (err) {
       res.status(500).json({ error: err.message });
-    } else {
-      const seller = {
-        id: row.id,
-        name: row.name,
-        balance: row.balance,
-        gameNickname: row.game_nickname
-      };
-      res.json(seller);
+      return;
     }
+    // Преобразуем snake_case в camelCase
+    const seller = {
+      id: row.id,
+      name: row.name,
+      balance: row.balance,
+      gameNickname: row.game_nickname
+    };
+    res.json(seller);
   });
 });
 
-// Получить всех поставщиков (публичный)
-app.get('/api/suppliers', guestAccess, (req, res) => {
+// Обновление баланса продавца
+app.put('/api/seller/balance', (req, res) => {
+  const { balance } = req.body;
+  
+  db.run('UPDATE seller SET balance = ? WHERE id = 1', [balance], function(err) {
+    if (err) {
+      res.status(500).json({ error: err.message });
+      return;
+    }
+    res.json({ success: true, balance });
+  });
+});
+
+// Получение статистики
+app.get('/api/stats', (req, res) => {
+  db.get(`SELECT 
+    (SELECT COALESCE(SUM(debt), 0) FROM suppliers) as totalDebt,
+    (SELECT COUNT(*) FROM suppliers) as supplierCount,
+    (SELECT COUNT(*) FROM orders WHERE status = 'active') as totalOrders`,
+    (err, row) => {
+      if (err) {
+        res.status(500).json({ error: err.message });
+        return;
+      }
+      res.json({
+        totalDebt: row.totalDebt,
+        supplierCount: row.supplierCount,
+        totalOrders: row.totalOrders
+      });
+    }
+  );
+});
+
+// Получение всех поставщиков
+app.get('/api/suppliers', (req, res) => {
   db.all('SELECT * FROM suppliers ORDER BY created_at DESC', (err, rows) => {
     if (err) {
       res.status(500).json({ error: err.message });
-    } else {
-      const suppliers = rows.map(row => ({
-        id: row.id,
-        name: row.name,
-        gameNickname: row.game_nickname,
-        debt: row.debt,
-        ordersCount: row.orders_count,
-        createdAt: row.created_at,
-        updatedAt: row.updated_at
-      }));
-      res.json(suppliers);
+      return;
     }
+    // Преобразуем snake_case в camelCase
+    const suppliers = rows.map(row => ({
+      id: row.id,
+      name: row.name,
+      gameNickname: row.game_nickname,
+      debt: row.debt,
+      ordersCount: row.orders_count,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at
+    }));
+    res.json(suppliers);
   });
 });
 
-// Получить одного поставщика по ID (публичный)
-app.get('/api/suppliers/:id', guestAccess, (req, res) => {
-  const id = parseInt(req.params.id);
+// Получение поставщика по ID
+app.get('/api/suppliers/:id', (req, res) => {
+  const { id } = req.params;
   
   db.get('SELECT * FROM suppliers WHERE id = ?', [id], (err, row) => {
     if (err) {
       res.status(500).json({ error: err.message });
-    } else if (!row) {
-      res.status(404).json({ error: 'Поставщик не найден' });
-    } else {
-      const supplier = {
-        id: row.id,
-        name: row.name,
-        gameNickname: row.game_nickname,
-        debt: row.debt,
-        ordersCount: row.orders_count,
-        createdAt: row.created_at,
-        updatedAt: row.updated_at
-      };
-      res.json(supplier);
-    }
-  });
-});
-
-// Получить все заказы поставщика (публичный)
-app.get('/api/suppliers/:id/orders', guestAccess, (req, res) => {
-  const supplierId = parseInt(req.params.id);
-  
-  db.all(
-    `SELECT * FROM orders WHERE supplier_id = ? ORDER BY created_at DESC`,
-    [supplierId],
-    (err, rows) => {
-      if (err) {
-        res.status(500).json({ error: err.message });
-      } else {
-        const orders = rows.map(row => ({
-          id: row.id,
-          supplierId: row.supplier_id,
-          imageUrl: row.image_url,
-          cost: row.cost,
-          premium: row.premium,
-          debtAmount: row.debt_amount,
-          status: row.status,
-          notes: row.notes,
-          createdAt: row.created_at,
-          updatedAt: row.updated_at
-        }));
-        res.json(orders);
-      }
-    }
-  );
-});
-
-// Получить статистику (публичный)
-app.get('/api/stats', guestAccess, (req, res) => {
-  const stats = {};
-  
-  db.get('SELECT SUM(debt) as total_debt FROM suppliers', (err, row) => {
-    if (err) {
-      return res.status(500).json({ error: err.message });
-    }
-    stats.totalDebt = row.total_debt || 0;
-    
-    db.get('SELECT SUM(orders_count) as total_orders FROM suppliers', (err, row) => {
-      if (err) {
-        return res.status(500).json({ error: err.message });
-      }
-      stats.totalOrders = row.total_orders || 0;
-      
-      db.get('SELECT COUNT(*) as supplier_count FROM suppliers', (err, row) => {
-        if (err) {
-          return res.status(500).json({ error: err.message });
-        }
-        stats.supplierCount = row.supplier_count || 0;
-        
-        res.json(stats);
-      });
-    });
-  });
-});
-
-// ==================== ЗАЩИЩЕННЫЕ ЭНДПОИНТЫ (только для продавца) ====================
-
-// Обновить баланс продавца (только продавец)
-app.put('/api/seller/balance', authenticate, (req, res) => {
-  const { balance } = req.body;
-  
-  if (balance === undefined || isNaN(balance)) {
-    return res.status(400).json({ error: 'Некорректное значение баланса' });
-  }
-
-  db.run(
-    'UPDATE seller SET balance = ? WHERE id = 1',
-    [parseFloat(balance)],
-    function(err) {
-      if (err) {
-        res.status(500).json({ error: err.message });
-      } else {
-        res.json({ 
-          message: 'Баланс обновлен', 
-          changes: this.changes 
-        });
-      }
-    }
-  );
-});
-
-// Добавить нового поставщика (только продавец)
-app.post('/api/suppliers', authenticate, (req, res) => {
-  const { name, gameNickname, debt = 0, ordersCount = 0 } = req.body;
-  
-  if (!name || !gameNickname) {
-    return res.status(400).json({ error: 'Имя и игровой ник обязательны' });
-  }
-
-  db.run(
-    `INSERT INTO suppliers (name, game_nickname, debt, orders_count, updated_at) 
-     VALUES (?, ?, ?, ?, datetime('now'))`,
-    [name, gameNickname, parseFloat(debt) || 0, parseInt(ordersCount) || 0],
-    function(err) {
-      if (err) {
-        res.status(500).json({ error: err.message });
-      } else {
-        db.get('SELECT * FROM suppliers WHERE id = ?', [this.lastID], (err, row) => {
-          if (err) {
-            res.status(500).json({ error: err.message });
-          } else {
-            const supplier = {
-              id: row.id,
-              name: row.name,
-              gameNickname: row.game_nickname,
-              debt: row.debt,
-              ordersCount: row.orders_count,
-              createdAt: row.created_at,
-              updatedAt: row.updated_at
-            };
-            res.status(201).json(supplier);
-          }
-        });
-      }
-    }
-  );
-});
-
-// Обновить информацию о поставщике (только продавец)
-app.put('/api/suppliers/:id', authenticate, (req, res) => {
-  const id = parseInt(req.params.id);
-  const { name, gameNickname, debt, ordersCount } = req.body;
-  
-  db.get('SELECT * FROM suppliers WHERE id = ?', [id], (err, row) => {
-    if (err) {
-      return res.status(500).json({ error: err.message });
+      return;
     }
     if (!row) {
-      return res.status(404).json({ error: 'Поставщик не найден' });
+      res.status(404).json({ error: 'Поставщик не найден' });
+      return;
     }
-
-    const updatedName = name || row.name;
-    const updatedGameNickname = gameNickname || row.game_nickname;
-    const updatedDebt = debt !== undefined ? parseFloat(debt) : row.debt;
-    const updatedOrdersCount = ordersCount !== undefined ? parseInt(ordersCount) : row.orders_count;
-
-    db.run(
-      `UPDATE suppliers 
-       SET name = ?, game_nickname = ?, debt = ?, orders_count = ?, updated_at = datetime('now') 
-       WHERE id = ?`,
-      [updatedName, updatedGameNickname, updatedDebt, updatedOrdersCount, id],
-      function(err) {
-        if (err) {
-          res.status(500).json({ error: err.message });
-        } else {
-          res.json({ 
-            message: 'Поставщик обновлен', 
-            changes: this.changes 
-          });
-        }
-      }
-    );
+    const supplier = {
+      id: row.id,
+      name: row.name,
+      gameNickname: row.game_nickname,
+      debt: row.debt,
+      ordersCount: row.orders_count,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at
+    };
+    res.json(supplier);
   });
 });
 
-// Удалить поставщика (только продавец)
-app.delete('/api/suppliers/:id', authenticate, (req, res) => {
-  const id = parseInt(req.params.id);
+// Добавление поставщика
+app.post('/api/suppliers', (req, res) => {
+  const { name, gameNickname, debt = 0, ordersCount = 0 } = req.body;
+  
+  db.run(
+    'INSERT INTO suppliers (name, game_nickname, debt, orders_count) VALUES (?, ?, ?, ?)',
+    [name, gameNickname, debt, ordersCount],
+    function(err) {
+      if (err) {
+        res.status(500).json({ error: err.message });
+        return;
+      }
+      
+      res.json({
+        id: this.lastID,
+        name,
+        gameNickname,
+        debt,
+        ordersCount,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString()
+      });
+    }
+  );
+});
+
+// Обновление поставщика
+app.put('/api/suppliers/:id', (req, res) => {
+  const { id } = req.params;
+  const { name, gameNickname, debt, ordersCount } = req.body;
+  
+  db.run(
+    'UPDATE suppliers SET name = ?, game_nickname = ?, debt = ?, orders_count = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
+    [name, gameNickname, debt, ordersCount, id],
+    function(err) {
+      if (err) {
+        res.status(500).json({ error: err.message });
+        return;
+      }
+      
+      if (this.changes === 0) {
+        res.status(404).json({ error: 'Поставщик не найден' });
+        return;
+      }
+      
+      res.json({ success: true });
+    }
+  );
+});
+
+// Удаление поставщика
+app.delete('/api/suppliers/:id', (req, res) => {
+  const { id } = req.params;
   
   db.run('DELETE FROM suppliers WHERE id = ?', [id], function(err) {
     if (err) {
       res.status(500).json({ error: err.message });
-    } else if (this.changes === 0) {
+      return;
+    }
+    
+    if (this.changes === 0) {
       res.status(404).json({ error: 'Поставщик не найден' });
-    } else {
-      res.json({ 
-        message: 'Поставщик удален', 
-        changes: this.changes 
-      });
+      return;
     }
+    
+    // Также удаляем связанные заказы
+    db.run('DELETE FROM orders WHERE supplier_id = ?', [id]);
+    
+    res.json({ success: true });
   });
 });
 
-// Создать новый заказ (только продавец)
-app.post('/api/orders', authenticate, (req, res) => {
-  const { supplierId, imageUrl, cost, premium, notes } = req.body;
+// Получение заказов поставщика
+app.get('/api/suppliers/:id/orders', (req, res) => {
+  const { id } = req.params;
   
-  console.log('Creating order with data:', { supplierId, imageUrl, cost, premium, notes });
-  
-  if (!supplierId || !imageUrl || cost === undefined) {
-    return res.status(400).json({ error: 'Необходимы supplierId, imageUrl и cost' });
-  }
-
-  try {
-    // Расчет: стоимость - (стоимость × 30%) - премиум
-    const calculatedDebt = parseFloat(cost) - (parseFloat(cost) * 0.3) - (parseFloat(premium) || 0);
-    
-    console.log('Calculated debt (cost - 30% - premium):', calculatedDebt);
-
-    db.run(
-      `INSERT INTO orders (supplier_id, image_url, cost, premium, debt_amount, notes, updated_at) 
-       VALUES (?, ?, ?, ?, ?, ?, datetime('now'))`,
-      [
-        supplierId, 
-        imageUrl, 
-        parseFloat(cost) || 0, 
-        parseFloat(premium) || 0, 
-        calculatedDebt, 
-        notes || ''
-      ],
-      function(err) {
-        if (err) {
-          console.error('Database error:', err);
-          return res.status(500).json({ error: err.message });
-        }
-        
-        const orderId = this.lastID;
-        console.log('Order created with ID:', orderId);
-        
-        db.get(
-          `SELECT COALESCE(SUM(debt_amount), 0) as total_debt, 
-                  COUNT(*) as orders_count 
-           FROM orders 
-           WHERE supplier_id = ? AND status = 'active'`,
-          [supplierId],
-          (err, result) => {
-            if (err) {
-              console.error('Error calculating supplier debt:', err);
-            } else {
-              console.log('Updating supplier debt:', result);
-              
-              db.run(
-                `UPDATE suppliers 
-                 SET debt = ?, orders_count = ?, updated_at = datetime('now') 
-                 WHERE id = ?`,
-                [result.total_debt, result.orders_count, supplierId],
-                (err) => {
-                  if (err) {
-                    console.error('Error updating supplier:', err);
-                  }
-                }
-              );
-            }
-            
-            db.get('SELECT * FROM orders WHERE id = ?', [orderId], (err, row) => {
-              if (err) {
-                console.error('Error fetching created order:', err);
-                return res.status(500).json({ error: err.message });
-              }
-              
-              const order = {
-                id: row.id,
-                supplierId: row.supplier_id,
-                imageUrl: row.image_url,
-                cost: row.cost,
-                premium: row.premium,
-                debtAmount: row.debt_amount,
-                status: row.status,
-                notes: row.notes,
-                createdAt: row.created_at,
-                updatedAt: row.updated_at
-              };
-              
-              console.log('Returning order:', order);
-              res.status(201).json(order);
-            });
-          }
-        );
+  db.all(
+    'SELECT * FROM orders WHERE supplier_id = ? ORDER BY created_at DESC',
+    [id],
+    (err, rows) => {
+      if (err) {
+        res.status(500).json({ error: err.message });
+        return;
       }
-    );
-  } catch (error) {
-    console.error('Error in order creation:', error);
-    res.status(500).json({ error: 'Внутренняя ошибка сервера' });
-  }
+      
+      // Преобразуем snake_case в camelCase
+      const orders = rows.map(order => ({
+        id: order.id,
+        supplierId: order.supplier_id,
+        imageUrl: order.image_url,
+        cost: order.cost,
+        premium: order.premium,
+        debtAmount: order.debt_amount,
+        status: order.status,
+        notes: order.notes,
+        createdAt: order.created_at,
+        updatedAt: order.updated_at,
+        isSplit: order.is_split === 1,
+        splitWith: order.split_with
+      }));
+      
+      res.json(orders);
+    }
+  );
 });
 
-// Обновить заказ (только продавец)
-app.put('/api/orders/:id', authenticate, (req, res) => {
-  const orderId = parseInt(req.params.id);
-  const { imageUrl, cost, premium, status, notes } = req.body;
-  
-  console.log('Updating order:', { orderId, imageUrl, cost, premium, status, notes });
-  
-  db.get('SELECT * FROM orders WHERE id = ?', [orderId], (err, row) => {
-    if (err) {
-      console.error('Database error:', err);
-      return res.status(500).json({ error: err.message });
-    }
-    if (!row) {
-      return res.status(404).json({ error: 'Заказ не найден' });
-    }
-
-    const newCost = cost !== undefined ? parseFloat(cost) : row.cost;
-    const newPremium = premium !== undefined ? parseFloat(premium) : row.premium;
-    
-    let newDebtAmount = row.debt_amount;
-    if (cost !== undefined || premium !== undefined) {
-      newDebtAmount = newCost - (newCost * 0.3) - newPremium;
-      console.log('Recalculated debt (cost - 30% - premium):', newDebtAmount);
-    }
-
-    db.run(
-      `UPDATE orders 
-       SET image_url = ?, cost = ?, premium = ?, debt_amount = ?, 
-           status = ?, notes = ?, updated_at = datetime('now') 
-       WHERE id = ?`,
-      [
-        imageUrl || row.image_url,
-        newCost,
-        newPremium,
-        newDebtAmount,
-        status || row.status,
-        notes || row.notes,
-        orderId
-      ],
-      function(err) {
-        if (err) {
-          console.error('Database error:', err);
-          return res.status(500).json({ error: err.message });
-        }
-        
-        console.log('Order updated, changes:', this.changes);
-        
-        db.get(
-          `SELECT COALESCE(SUM(debt_amount), 0) as total_debt, 
-                  COUNT(*) as orders_count 
-           FROM orders 
-           WHERE supplier_id = ? AND status = 'active'`,
-          [row.supplier_id],
-          (err, result) => {
-            if (err) {
-              console.error('Error calculating supplier debt:', err);
-            } else {
-              console.log('Updating supplier with new debt:', result);
-              
-              db.run(
-                `UPDATE suppliers 
-                 SET debt = ?, orders_count = ?, updated_at = datetime('now') 
-                 WHERE id = ?`,
-                [result.total_debt, result.orders_count, row.supplier_id],
-                (err) => {
-                  if (err) {
-                    console.error('Error updating supplier:', err);
-                  }
-                }
-              );
-            }
-            
-            res.json({ 
-              message: 'Заказ обновлен', 
-              changes: this.changes 
-            });
-          }
-        );
+// Получение всех заказов
+app.get('/api/orders', (req, res) => {
+  db.all(
+    'SELECT * FROM orders ORDER BY created_at DESC',
+    (err, rows) => {
+      if (err) {
+        res.status(500).json({ error: err.message });
+        return;
       }
-    );
-  });
+      
+      const orders = rows.map(order => ({
+        id: order.id,
+        supplierId: order.supplier_id,
+        imageUrl: order.image_url,
+        cost: order.cost,
+        premium: order.premium,
+        debtAmount: order.debt_amount,
+        status: order.status,
+        notes: order.notes,
+        createdAt: order.created_at,
+        updatedAt: order.updated_at,
+        isSplit: order.is_split === 1,
+        splitWith: order.split_with
+      }));
+      
+      res.json(orders);
+    }
+  );
 });
 
-// Удалить заказ (только продавец)
-app.delete('/api/orders/:id', authenticate, (req, res) => {
-  const orderId = parseInt(req.params.id);
+// Получение заказа по ID
+app.get('/api/orders/:id', (req, res) => {
+  const { id } = req.params;
   
-  db.get('SELECT * FROM orders WHERE id = ?', [orderId], (err, order) => {
+  db.get('SELECT * FROM orders WHERE id = ?', [id], (err, order) => {
     if (err) {
-      console.error('Database error:', err);
-      return res.status(500).json({ error: err.message });
+      res.status(500).json({ error: err.message });
+      return;
     }
+    
     if (!order) {
-      return res.status(404).json({ error: 'Заказ не найден' });
+      res.status(404).json({ error: 'Заказ не найден' });
+      return;
     }
+    
+    const formattedOrder = {
+      id: order.id,
+      supplierId: order.supplier_id,
+      imageUrl: order.image_url,
+      cost: order.cost,
+      premium: order.premium,
+      debtAmount: order.debt_amount,
+      status: order.status,
+      notes: order.notes,
+      createdAt: order.created_at,
+      updatedAt: order.updated_at,
+      isSplit: order.is_split === 1,
+      splitWith: order.split_with
+    };
+    
+    res.json(formattedOrder);
+  });
+});
 
-    db.run('DELETE FROM orders WHERE id = ?', [orderId], function(err) {
+// Создание заказа (ИСПРАВЛЕН РАСЧЕТ)
+app.post('/api/orders', (req, res) => {
+  const { supplierId, imageUrl, cost, premium, notes, status = 'active', isSplit = false, splitWith = null } = req.body;
+  
+  // Расчет задолженности (ИСПРАВЛЕНО)
+  let debtAmount;
+  if (isSplit) {
+    // ДЛЯ РАЗДЕЛЕННЫХ ЗАКАЗОВ: (стоимость/2) - (премиум/2)
+    // При создании разделенного заказа, frontend должен передать уже разделенные значения
+    // Проверяем, что значения уже поделены пополам
+    if (cost > 100000) { // Если стоимость слишком большая, возможно передана полная сумма
+      console.warn('Внимание: Возможно передана полная стоимость для разделенного заказа');
+    }
+    debtAmount = cost - premium; // cost и premium уже должны быть разделены пополам
+  } else {
+    // Для обычных заказов: стоимость - 30% - премиум
+    debtAmount = cost - (cost * 0.3) - premium;
+  }
+  
+  console.log(`Создание заказа: isSplit=${isSplit}, cost=${cost}, premium=${premium}, debtAmount=${debtAmount}`);
+  
+  db.run(
+    `INSERT INTO orders (supplier_id, image_url, cost, premium, debt_amount, status, notes, is_split, split_with) 
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [supplierId, imageUrl, cost, premium, debtAmount, status, notes, isSplit ? 1 : 0, splitWith],
+    function(err) {
       if (err) {
         console.error('Database error:', err);
-        return res.status(500).json({ error: err.message });
+        res.status(500).json({ error: err.message });
+        return;
       }
       
-      console.log('Order deleted, changes:', this.changes);
-      
-      db.get(
-        `SELECT COALESCE(SUM(debt_amount), 0) as total_debt, 
-                COUNT(*) as orders_count 
-         FROM orders 
-         WHERE supplier_id = ? AND status = 'active'`,
-        [order.supplier_id],
-        (err, result) => {
+      // Обновляем задолженность и количество заказов поставщика
+      db.run(
+        `UPDATE suppliers 
+         SET debt = (
+           SELECT COALESCE(SUM(debt_amount), 0) 
+           FROM orders 
+           WHERE supplier_id = ? AND status = 'active'
+         ),
+         orders_count = (
+           SELECT COUNT(*) 
+           FROM orders 
+           WHERE supplier_id = ? AND status = 'active'
+         ),
+         updated_at = CURRENT_TIMESTAMP 
+         WHERE id = ?`,
+        [supplierId, supplierId, supplierId],
+        (err) => {
           if (err) {
-            console.error('Error calculating supplier debt:', err);
-          } else {
-            console.log('Updating supplier after deletion:', result);
+            console.error('Error updating supplier:', err);
+          }
+        }
+      );
+      
+      // Получаем созданный заказ для ответа
+      db.get('SELECT * FROM orders WHERE id = ?', [this.lastID], (err, newOrder) => {
+        if (err) {
+          res.status(500).json({ error: err.message });
+          return;
+        }
+        
+        const responseOrder = {
+          id: newOrder.id,
+          supplierId: newOrder.supplier_id,
+          imageUrl: newOrder.image_url,
+          cost: newOrder.cost,
+          premium: newOrder.premium,
+          debtAmount: newOrder.debt_amount,
+          status: newOrder.status,
+          notes: newOrder.notes,
+          createdAt: newOrder.created_at,
+          updatedAt: newOrder.updated_at,
+          isSplit: newOrder.is_split === 1,
+          splitWith: newOrder.split_with
+        };
+        
+        res.json(responseOrder);
+      });
+    }
+  );
+});
+
+// Разделение заказа пополам (ИСПРАВЛЕН РАСЧЕТ)
+app.post('/api/orders/:id/split', (req, res) => {
+  const { id } = req.params;
+  const { splitWith } = req.body;
+  
+  // Получаем исходный заказ
+  db.get('SELECT * FROM orders WHERE id = ?', [id], (err, originalOrder) => {
+    if (err) {
+      res.status(500).json({ error: err.message });
+      return;
+    }
+    
+    if (!originalOrder) {
+      res.status(404).json({ error: 'Заказ не найден' });
+      return;
+    }
+    
+    // Расчет половины стоимости и премиума
+    const halfCost = originalOrder.cost / 2;
+    const halfPremium = originalOrder.premium / 2;
+    // ИСПРАВЛЕННЫЙ РАСЧЕТ: (стоимость/2) - (премиум/2)
+    const halfDebt = halfCost - halfPremium;
+    
+    console.log(`Разделение заказа ${id}:`);
+    console.log(`Полная стоимость: ${originalOrder.cost}, Премиум: ${originalOrder.premium}`);
+    console.log(`Половина стоимости: ${halfCost}, Половина премиума: ${halfPremium}`);
+    console.log(`Задолженность за половину: ${halfDebt} (${halfCost} - ${halfPremium})`);
+    
+    // Обновляем исходный заказ как разделенный
+    db.run(
+      `UPDATE orders 
+       SET cost = ?, premium = ?, debt_amount = ?, is_split = 1, split_with = ?, updated_at = CURRENT_TIMESTAMP 
+       WHERE id = ?`,
+      [halfCost, halfPremium, halfDebt, splitWith, id],
+      function(err) {
+        if (err) {
+          res.status(500).json({ error: err.message });
+          return;
+        }
+        
+        // Создаем второй заказ (вторая половина)
+        db.run(
+          `INSERT INTO orders (supplier_id, image_url, cost, premium, debt_amount, status, notes, is_split, split_with) 
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          [originalOrder.supplier_id, originalOrder.image_url, halfCost, halfPremium, halfDebt, 
+           originalOrder.status, originalOrder.notes || '', 1, splitWith],
+          function(err) {
+            if (err) {
+              res.status(500).json({ error: err.message });
+              return;
+            }
             
+            // Обновляем задолженность и количество заказов поставщика
             db.run(
               `UPDATE suppliers 
-               SET debt = ?, orders_count = ?, updated_at = datetime('now') 
+               SET debt = (
+                 SELECT COALESCE(SUM(debt_amount), 0) 
+                 FROM orders 
+                 WHERE supplier_id = ? AND status = 'active'
+               ),
+               orders_count = (
+                 SELECT COUNT(*) 
+                 FROM orders 
+                 WHERE supplier_id = ? AND status = 'active'
+               ),
+               updated_at = CURRENT_TIMESTAMP 
                WHERE id = ?`,
-              [result.total_debt, result.orders_count, order.supplier_id],
+              [originalOrder.supplier_id, originalOrder.supplier_id, originalOrder.supplier_id],
               (err) => {
                 if (err) {
                   console.error('Error updating supplier:', err);
                 }
+                
+                res.json({
+                  success: true,
+                  originalOrderId: id,
+                  newOrderId: this.lastID,
+                  halfCost: halfCost,
+                  halfPremium: halfPremium,
+                  halfDebt: halfDebt,
+                  message: 'Заказ успешно разделен пополам'
+                });
               }
             );
           }
-          
-          res.json({ 
-            message: 'Заказ удален', 
-            changes: this.changes 
-          });
+        );
+      }
+    );
+  });
+});
+
+// Обновление заказа (ИСПРАВЛЕН РАСЧЕТ)
+app.put('/api/orders/:id', (req, res) => {
+  const { id } = req.params;
+  const { supplierId, imageUrl, cost, premium, notes, status, isSplit = false, splitWith = null } = req.body;
+  
+  // Расчет новой задолженности (ИСПРАВЛЕНО)
+  let debtAmount;
+  if (isSplit) {
+    // ДЛЯ РАЗДЕЛЕННЫХ ЗАКАЗОВ: (стоимость/2) - (премиум/2)
+    // cost и premium уже должны быть разделены пополам
+    debtAmount = cost - premium;
+  } else {
+    // Для обычных заказов: стоимость - 30% - премиум
+    debtAmount = cost - (cost * 0.3) - premium;
+  }
+  
+  console.log(`Обновление заказа ${id}: isSplit=${isSplit}, cost=${cost}, premium=${premium}, debtAmount=${debtAmount}`);
+  
+  db.run(
+    `UPDATE orders 
+     SET supplier_id = ?, image_url = ?, cost = ?, premium = ?, debt_amount = ?, 
+         status = ?, notes = ?, updated_at = CURRENT_TIMESTAMP, is_split = ?, split_with = ?
+     WHERE id = ?`,
+    [supplierId, imageUrl, cost, premium, debtAmount, status, notes, isSplit ? 1 : 0, splitWith, id],
+    function(err) {
+      if (err) {
+        res.status(500).json({ error: err.message });
+        return;
+      }
+      
+      if (this.changes === 0) {
+        res.status(404).json({ error: 'Заказ не найден' });
+        return;
+      }
+      
+      // Обновляем задолженность и количество заказов поставщика
+      db.run(
+        `UPDATE suppliers 
+         SET debt = (
+           SELECT COALESCE(SUM(debt_amount), 0) 
+           FROM orders 
+           WHERE supplier_id = ? AND status = 'active'
+         ),
+         orders_count = (
+           SELECT COUNT(*) 
+           FROM orders 
+           WHERE supplier_id = ? AND status = 'active'
+         ),
+         updated_at = CURRENT_TIMESTAMP 
+         WHERE id = ?`,
+        [supplierId, supplierId, supplierId],
+        (err) => {
+          if (err) {
+            console.error('Error updating supplier:', err);
+          }
+          res.json({ success: true });
+        }
+      );
+    }
+  );
+});
+
+// Удаление заказа
+app.delete('/api/orders/:id', (req, res) => {
+  const { id } = req.params;
+  
+  // Сначала получаем информацию о заказе для обновления поставщика
+  db.get('SELECT supplier_id FROM orders WHERE id = ?', [id], (err, order) => {
+    if (err) {
+      res.status(500).json({ error: err.message });
+      return;
+    }
+    
+    if (!order) {
+      res.status(404).json({ error: 'Заказ не найден' });
+      return;
+    }
+    
+    const supplierId = order.supplier_id;
+    
+    // Удаляем заказ
+    db.run('DELETE FROM orders WHERE id = ?', [id], function(err) {
+      if (err) {
+        res.status(500).json({ error: err.message });
+        return;
+      }
+      
+      if (this.changes === 0) {
+        res.status(404).json({ error: 'Заказ не найден' });
+        return;
+      }
+      
+      // Обновляем задолженность и количество заказов поставщика
+      db.run(
+        `UPDATE suppliers 
+         SET debt = (
+           SELECT COALESCE(SUM(debt_amount), 0) 
+           FROM orders 
+           WHERE supplier_id = ? AND status = 'active'
+         ),
+         orders_count = (
+           SELECT COUNT(*) 
+           FROM orders 
+           WHERE supplier_id = ? AND status = 'active'
+         ),
+         updated_at = CURRENT_TIMESTAMP 
+         WHERE id = ?`,
+        [supplierId, supplierId, supplierId],
+        (err) => {
+          if (err) {
+            console.error('Error updating supplier:', err);
+          }
+          res.json({ success: true });
         }
       );
     });
   });
 });
 
-// ==================== ОБРАБОТКА ОШИБОК ====================
-
-app.use('/api/*', (req, res) => {
-  console.error(`API endpoint not found: ${req.method} ${req.originalUrl}`);
-  res.status(404).json({ 
-    error: 'API endpoint not found',
-    message: `Endpoint ${req.method} ${req.originalUrl} не найден`
-  });
+// Аутентификация (заглушка)
+app.post('/api/login', (req, res) => {
+  const { username, password } = req.body;
+  
+  // Простая проверка (в реальном приложении используйте базу данных)
+  if (username === 'seller' && password === 'password123') {
+    res.json({
+      success: true,
+      token: 'fake-jwt-token',
+      user: {
+        id: 1,
+        username: 'seller',
+        role: 'seller',
+        name: 'Иван Иванов'
+      }
+    });
+  } else {
+    res.status(401).json({ success: false, error: 'Неверные учетные данные' });
+  }
 });
 
-app.use((err, req, res, next) => {
-  console.error('Server error:', err);
-  res.status(500).json({ 
-    error: 'Internal server error',
-    message: 'Внутренняя ошибка сервера'
-  });
+// Проверка аутентификации
+app.get('/api/verify-auth', (req, res) => {
+  const token = req.headers.authorization?.replace('Bearer ', '');
+  
+  if (token === 'fake-jwt-token') {
+    res.json({ authenticated: true });
+  } else {
+    res.status(401).json({ authenticated: false });
+  }
 });
 
-// ==================== ЗАПУСК СЕРВЕРА ====================
-
+// Запуск сервера
 app.listen(PORT, () => {
-  console.log(`========================================`);
   console.log(`Сервер запущен на порту ${PORT}`);
-  console.log(`Логин продавца: kizuma / kizuma`);
-  console.log(`API доступно по адресу: http://localhost:${PORT}`);
-  console.log(`Доступные эндпоиниты:`);
-  console.log(`  POST /api/login - вход в систему`);
-  console.log(`  GET  /api/verify-auth - проверка аутентификации`);
-  console.log(`  GET  /api/seller - информация о продавце (публичный)`);
-  console.log(`  GET  /api/suppliers - все поставщики (публичный)`);
-  console.log(`  GET  /api/suppliers/:id - поставщик по ID (публичный)`);
-  console.log(`  GET  /api/suppliers/:id/orders - заказы поставщика (публичный)`);
-  console.log(`  GET  /api/stats - статистика (публичный)`);
-  console.log(`  PUT  /api/seller/balance - обновление баланса (только продавец)`);
-  console.log(`  POST /api/suppliers - добавить поставщика (только продавец)`);
-  console.log(`  PUT  /api/suppliers/:id - обновить поставщика (только продавец)`);
-  console.log(`  DELETE /api/suppliers/:id - удалить поставщика (только продавец)`);
-  console.log(`  POST /api/orders - создать заказ (только продавец)`);
-  console.log(`  PUT  /api/orders/:id - обновить заказ (только продавец)`);
-  console.log(`  DELETE /api/orders/:id - удалить заказ (только продавец)`);
-  console.log(`========================================`);
-});
-
-process.on('SIGINT', () => {
-  db.close((err) => {
-    if (err) {
-      console.error('Ошибка при закрытии базы данных:', err.message);
-    } else {
-      console.log('Подключение к базе данных закрыто');
-    }
-    process.exit(0);
-  });
+  console.log('ИСПРАВЛЕННЫЙ расчет для разделенного заказа:');
+  console.log('Пример: Стоимость: 159, Премиум: 25');
+  console.log('Расчет: (159/2) - (25/2) = 79.5 - 12.5 = 67');
 });
